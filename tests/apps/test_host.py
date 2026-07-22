@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from mcp_cli.apps.host import AppHostServer, _SAFE_CSP_SOURCE
+from mcp_cli.apps.host import AppHostServer, _is_allowed_origin, _SAFE_CSP_SOURCE
 from mcp_cli.apps.models import AppInfo, AppState
 
 
@@ -404,6 +404,7 @@ class TestFetchHttpResource:
         fake_response = MagicMock()
         fake_response.text = "<html>fetched</html>"
         fake_response.headers = {"content-type": "text/html"}
+        fake_response.is_redirect = False
         fake_response.raise_for_status = MagicMock()
 
         fake_client = MagicMock()
@@ -411,7 +412,10 @@ class TestFetchHttpResource:
         fake_client.__aenter__ = AsyncMock(return_value=fake_client)
         fake_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("httpx.AsyncClient", return_value=fake_client):
+        with (
+            patch("httpx.AsyncClient", return_value=fake_client),
+            patch("mcp_cli.apps.host.is_safe_fetch_url", return_value=True),
+        ):
             html, resource = await AppHostServer._fetch_http_resource(
                 "https://example.com/app.html"
             )
@@ -428,6 +432,7 @@ class TestFetchHttpResource:
         import httpx
 
         fake_response = MagicMock()
+        fake_response.is_redirect = False
         fake_response.raise_for_status = MagicMock(
             side_effect=httpx.HTTPStatusError(
                 "404", request=MagicMock(), response=MagicMock()
@@ -439,9 +444,82 @@ class TestFetchHttpResource:
         fake_client.__aenter__ = AsyncMock(return_value=fake_client)
         fake_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("httpx.AsyncClient", return_value=fake_client):
+        with (
+            patch("httpx.AsyncClient", return_value=fake_client),
+            patch("mcp_cli.apps.host.is_safe_fetch_url", return_value=True),
+        ):
             with pytest.raises(httpx.HTTPStatusError):
                 await AppHostServer._fetch_http_resource("https://example.com/missing")
+
+    @pytest.mark.asyncio
+    async def test_rejects_disallowed_url_before_fetching(self):
+        """A URL that fails is_safe_fetch_url is never sent to httpx."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        fake_client = MagicMock()
+        fake_client.get = AsyncMock()
+        fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("httpx.AsyncClient", return_value=fake_client),
+            patch("mcp_cli.apps.host.is_safe_fetch_url", return_value=False),
+        ):
+            with pytest.raises(RuntimeError, match="disallowed URL"):
+                await AppHostServer._fetch_http_resource(
+                    "http://169.254.169.254/latest/meta-data/"
+                )
+
+        fake_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_disallowed_target_is_rejected(self):
+        """A redirect hop pointing at a disallowed URL is rejected, not followed."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        redirect_response = MagicMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {"location": "http://169.254.169.254/secret"}
+        redirect_response.url = httpx.URL("https://example.com/app.html")
+
+        fake_client = MagicMock()
+        fake_client.get = AsyncMock(return_value=redirect_response)
+        fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = AsyncMock(return_value=False)
+
+        def _fake_is_safe(url):
+            return "169.254.169.254" not in url
+
+        with (
+            patch("httpx.AsyncClient", return_value=fake_client),
+            patch("mcp_cli.apps.host.is_safe_fetch_url", side_effect=_fake_is_safe),
+        ):
+            with pytest.raises(RuntimeError, match="disallowed URL"):
+                await AppHostServer._fetch_http_resource("https://example.com/app.html")
+
+    @pytest.mark.asyncio
+    async def test_too_many_redirects_raises(self):
+        """A redirect chain longer than _MAX_REDIRECTS raises."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        redirect_response = MagicMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {"location": "/next"}
+        redirect_response.url = httpx.URL("https://example.com/app.html")
+
+        fake_client = MagicMock()
+        fake_client.get = AsyncMock(return_value=redirect_response)
+        fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("httpx.AsyncClient", return_value=fake_client),
+            patch("mcp_cli.apps.host.is_safe_fetch_url", return_value=True),
+        ):
+            with pytest.raises(RuntimeError, match="Too many redirects"):
+                await AppHostServer._fetch_http_resource("https://example.com/app.html")
 
 
 # ── ExtractHtml (additional edge cases) ────────────────────────────────────
@@ -1106,7 +1184,7 @@ class TestStartServer:
 
     @pytest.mark.asyncio
     async def test_process_request_ws_returns_none(self):
-        """The process_request closure returns None for '/ws' (WS upgrade)."""
+        """The process_request closure returns None for '/ws' with a matching Origin."""
         from unittest.mock import MagicMock, patch
         from mcp_cli.apps.bridge import AppBridge
 
@@ -1126,6 +1204,117 @@ class TestStartServer:
         fake_conn = MagicMock()
         fake_req = MagicMock()
         fake_req.path = "/ws"
+        fake_req.headers = {"Origin": f"http://localhost:{info.port}"}
+
+        response = captured_process_request(fake_conn, fake_req)
+        assert response is None
+
+    async def test_process_request_ws_rejects_cross_origin(self):
+        """The process_request closure returns 403 for '/ws' with a foreign Origin."""
+        from unittest.mock import MagicMock, patch
+        import http
+        from mcp_cli.apps.bridge import AppBridge
+
+        host, info = self._make_host_and_app_info()
+        bridge = AppBridge(info, host.tool_manager)
+
+        captured_process_request = None
+
+        async def capture_serve(handler, host_addr, port, process_request=None):
+            nonlocal captured_process_request
+            captured_process_request = process_request
+            return MagicMock()
+
+        with patch("mcp_cli.apps.host.ws_serve", side_effect=capture_serve):
+            await host._start_server(info, bridge)
+
+        fake_conn = MagicMock()
+        fake_req = MagicMock()
+        fake_req.path = "/ws"
+        fake_req.headers = {"Origin": "https://evil-attacker.example"}
+
+        response = captured_process_request(fake_conn, fake_req)
+        assert response is not None
+        assert response.status_code == http.HTTPStatus.FORBIDDEN
+
+    async def test_process_request_ws_rejects_missing_origin(self):
+        """The process_request closure returns 403 for '/ws' with no Origin header."""
+        from unittest.mock import MagicMock, patch
+        import http
+        from mcp_cli.apps.bridge import AppBridge
+
+        host, info = self._make_host_and_app_info()
+        bridge = AppBridge(info, host.tool_manager)
+
+        captured_process_request = None
+
+        async def capture_serve(handler, host_addr, port, process_request=None):
+            nonlocal captured_process_request
+            captured_process_request = process_request
+            return MagicMock()
+
+        with patch("mcp_cli.apps.host.ws_serve", side_effect=capture_serve):
+            await host._start_server(info, bridge)
+
+        fake_conn = MagicMock()
+        fake_req = MagicMock()
+        fake_req.path = "/ws"
+        fake_req.headers = {}
+
+        response = captured_process_request(fake_conn, fake_req)
+        assert response is not None
+        assert response.status_code == http.HTTPStatus.FORBIDDEN
+
+    async def test_process_request_ws_rejects_wrong_port(self):
+        """A matching host/scheme but wrong port in Origin must still be rejected."""
+        from unittest.mock import MagicMock, patch
+        import http
+        from mcp_cli.apps.bridge import AppBridge
+
+        host, info = self._make_host_and_app_info()
+        bridge = AppBridge(info, host.tool_manager)
+
+        captured_process_request = None
+
+        async def capture_serve(handler, host_addr, port, process_request=None):
+            nonlocal captured_process_request
+            captured_process_request = process_request
+            return MagicMock()
+
+        with patch("mcp_cli.apps.host.ws_serve", side_effect=capture_serve):
+            await host._start_server(info, bridge)
+
+        fake_conn = MagicMock()
+        fake_req = MagicMock()
+        fake_req.path = "/ws"
+        fake_req.headers = {"Origin": f"http://localhost:{info.port + 1}"}
+
+        response = captured_process_request(fake_conn, fake_req)
+        assert response is not None
+        assert response.status_code == http.HTTPStatus.FORBIDDEN
+
+    async def test_process_request_ws_accepts_127_0_0_1_origin(self):
+        """127.0.0.1 is an accepted loopback-equivalent origin host."""
+        from unittest.mock import MagicMock, patch
+        from mcp_cli.apps.bridge import AppBridge
+
+        host, info = self._make_host_and_app_info()
+        bridge = AppBridge(info, host.tool_manager)
+
+        captured_process_request = None
+
+        async def capture_serve(handler, host_addr, port, process_request=None):
+            nonlocal captured_process_request
+            captured_process_request = process_request
+            return MagicMock()
+
+        with patch("mcp_cli.apps.host.ws_serve", side_effect=capture_serve):
+            await host._start_server(info, bridge)
+
+        fake_conn = MagicMock()
+        fake_req = MagicMock()
+        fake_req.path = "/ws"
+        fake_req.headers = {"Origin": f"http://127.0.0.1:{info.port}"}
 
         response = captured_process_request(fake_conn, fake_req)
         assert response is None
@@ -1451,3 +1640,52 @@ class TestLaunchAppBrowserControl:
 
         assert len(browser_calls) == 1
         assert "9999" in browser_calls[0]
+
+
+# ── _is_allowed_origin ──────────────────────────────────────────────────────
+
+
+class TestIsAllowedOrigin:
+    """Unit tests for the WebSocket Origin allow-list check."""
+
+    def test_matching_localhost_origin(self):
+        assert _is_allowed_origin("http://localhost:9470", 9470) is True
+
+    def test_matching_127_0_0_1_origin(self):
+        assert _is_allowed_origin("http://127.0.0.1:9470", 9470) is True
+
+    def test_wrong_port_rejected(self):
+        assert _is_allowed_origin("http://localhost:9471", 9470) is False
+
+    def test_foreign_host_rejected(self):
+        assert _is_allowed_origin("https://evil-attacker.example", 9470) is False
+
+    def test_https_scheme_rejected(self):
+        # The host page is only ever served over http://, never https://.
+        assert _is_allowed_origin("https://localhost:9470", 9470) is False
+
+    def test_none_origin_rejected(self):
+        assert _is_allowed_origin(None, 9470) is False
+
+    def test_empty_string_origin_rejected(self):
+        assert _is_allowed_origin("", 9470) is False
+
+    def test_null_origin_rejected(self):
+        # Browsers send the literal string "null" for opaque origins
+        # (sandboxed iframes, data: URLs, file:// pages).
+        assert _is_allowed_origin("null", 9470) is False
+
+    def test_subdomain_impersonation_rejected(self):
+        # "localhost.evil.example" must not be treated as the loopback host.
+        assert _is_allowed_origin("http://localhost.evil.example:9470", 9470) is False
+
+    def test_malformed_origin_rejected(self):
+        assert _is_allowed_origin("not a url at all", 9470) is False
+
+    def test_non_numeric_port_rejected_without_raising(self):
+        # .port raises ValueError for non-numeric ports on some Python
+        # versions; must be caught, not propagated to the caller.
+        assert _is_allowed_origin("http://localhost:notaport", 9470) is False
+
+    def test_malformed_ipv6_origin_rejected_without_raising(self):
+        assert _is_allowed_origin("http://[invalid::ipv6", 9470) is False
