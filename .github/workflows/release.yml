@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
     - name: Checkout code
@@ -82,3 +83,11 @@ jobs:
         prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Trigger publish workflow
+      # Releases created with the default GITHUB_TOKEN don't fire the
+      # `release: published` event for other workflows (anti-recursion
+      # rule), so dispatch publish.yml explicitly instead of relying on it.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh workflow run publish.yml --repo ${{ github.repository }} --ref ${{ steps.get_version.outputs.tag }}
